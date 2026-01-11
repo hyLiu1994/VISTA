@@ -9,3 +9,4 @@ src/utils/__pycache__/*
 src/modules/__pycache__/*
 results/*
 config/*
+results_s/
