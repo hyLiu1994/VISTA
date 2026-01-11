@@ -1,0 +1,31 @@
+################## Seed ###########################################################
+seed: 42
+
+################## exp_name ###########################################################
+exp_name: Default
+check_point: 0
+process_length: 2
+end_point: 4
+end_point_sdkg: 200
+pre_load: False
+
+################## Dataset ###########################################################
+raw_data_file: xxx
+trajectory_num: 10000
+trajectory_len: 200
+mini_segment_len: 20
+missing_ratio: 0.2
+training_test: 0.8
+
+################## VISTA Configuration ###############################################
+retry_times: 3            
+e_f: 3e-3        
+top_k: 5
+max_concurrent : 16
+max_retries : 3
+
+################## LLM Configuration #################################################
+llm_api_key: xxx
+mining_llm: qwen-plus 
+coding_llm: qwen-plus 
+analysis_llm: qwen-plus 

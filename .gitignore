@@ -1,0 +1,11 @@
+data/ProcessedData/*
+data/RawData/*
+data/CleanedFilteredData/*
+data/save_Date/*
+src/pipeline/__pycache__
+src/data/__pycache__/*
+src/data/utils/__pycache__
+src/utils/__pycache__/*
+src/modules/__pycache__/*
+results/*
+config/*
