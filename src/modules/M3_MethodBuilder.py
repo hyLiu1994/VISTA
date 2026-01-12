@@ -8,7 +8,7 @@ import re,pandas
 import logging
 import numpy as np
 from src.utils.CallApi import call_qwen_api
-from modules.Prompt import Function_Prompt
+from src.modules.Prompt import Function_Prompt
 
 def extract_function_and_description(text):
     """Extract function code and description from LLM output"""

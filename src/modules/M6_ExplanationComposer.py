@@ -1,7 +1,7 @@
 import re
 from typing import Dict
 from src.utils.CallApi import call_qwen_api
-from modules.Prompt import Explanation_Composer_Prompt
+from src.modules.Prompt import Explanation_Composer_Prompt
 import logging
 def extract_explanation(llm_output: str) -> Dict[str, str]:
     match = re.search(r"```(?:\w+)?\s*(.*?)\s*```", llm_output, re.DOTALL)

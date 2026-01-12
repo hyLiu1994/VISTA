@@ -5,7 +5,7 @@ root_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 sys.path.append(root_path)
 
 from src.utils.CallApi import call_qwen_api
-from modules.Prompt import Pattern_Prompt
+from src.modules.Prompt import Pattern_Prompt
 
 def extract_from_llm(rules, field_name):
     """Extract field value from LLM output"""
