@@ -1,6 +1,6 @@
 import argparse, os, sys
 import pandas as pd
-from utils.ais_data_utils import download_ais_dataset
+from src.data.utils.ais_data_utils import download_ais_dataset
 
 current_path = os.path.dirname(os.path.abspath(__file__))
 parent_current_path = os.path.dirname(current_path)
