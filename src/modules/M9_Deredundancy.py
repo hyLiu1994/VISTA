@@ -1,5 +1,5 @@
 from src.utils.CallApi import call_qwen_api
-from modules.Prompt import Redundancy_Analysis_Prompt
+from src.modules.Prompt import Redundancy_Analysis_Prompt
 import logging
 
 def deredundancy(args, SDKG, knowledge_unit_list, new_flags_list,vf_flags_list):

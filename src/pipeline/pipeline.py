@@ -1,15 +1,15 @@
 import logging
 from typing import List, Dict, Any
-from utils.utils import get_root_path
-from modules.M7_Scheduler import build_segment_tasks,stack_schedule_sdk_construction, stack_schedule_imputation
+from src.utils.utils import get_root_path
+from src.modules.M7_Scheduler import build_segment_tasks,stack_schedule_sdk_construction, stack_schedule_imputation
 root_path = get_root_path()
 
-from modules.M1_StaticSpatialEncoder import generate_vs
-from modules.M2_BehaviorAbstraction import generate_vb
-from modules.M3_MethodBuilder import generate_vf
-from modules.M4_BehaviorEstimator import behavior_estimator
-from modules.M5_MethodSelector import method_selector
-from modules.M6_ExplanationComposer import explanation_composer
+from src.modules.M1_StaticSpatialEncoder import generate_vs
+from src.modules.M2_BehaviorAbstraction import generate_vb
+from src.modules.M3_MethodBuilder import generate_vf
+from src.modules.M4_BehaviorEstimator import behavior_estimator
+from src.modules.M5_MethodSelector import method_selector
+from src.modules.M6_ExplanationComposer import explanation_composer
 
 def SDKG_process_single_segment(SDKG,args,task):
         if task['type'] == 'empty':

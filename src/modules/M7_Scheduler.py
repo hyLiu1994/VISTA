@@ -4,10 +4,10 @@ import json
 import numpy as np
 import logging
 import concurrent.futures
-from utils.utils import get_root_path
+from src.utils.utils import get_root_path
 root_path=get_root_path()
-from modules.M8_AnomalyDetection import handle_task_exception_with_retry
-from modules.M9_Deredundancy import deredundancy
+from src.modules.M8_AnomalyDetection import handle_task_exception_with_retry
+from src.modules.M9_Deredundancy import deredundancy
 
 class KnowledgeUnitManager:
     def __init__(self, args):
