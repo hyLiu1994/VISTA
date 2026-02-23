@@ -42,7 +42,14 @@ def execute_imputation(function, segment_data, prev_segment_data=None, next_segm
         T = np.array([(pd.to_datetime(ts) - start_time).total_seconds() for ts in timestamps])
         
         trajectory = function(start, end, T)
-        return np.array(trajectory, dtype=float)
+        if trajectory is None:
+            logging.warning("spatial_function returned None")
+            return None
+        traj_arr = np.array(trajectory, dtype=float)
+        if traj_arr.ndim != 2 or traj_arr.shape[1] != 2:
+            logging.warning(f"spatial_function returned invalid shape: {traj_arr.shape}, expected (N, 2)")
+            return None
+        return traj_arr
     except Exception as e:
         logging.warning(f"Imputation execution failed: {e}")
         return None
@@ -100,16 +107,30 @@ def evaluate_imputed_result(args, result_manager, test_df, mark_missing_test, sd
     processed_segments = 0
 
     comparison_data = []
-    
+
+    # Track failure statistics
+    total_results = len(result_manager.results_list)
+    skipped_nonmissing = 0  # non-missing segments (empty dict, intentionally skipped)
+    skipped_failed = 0      # result has None values (failed imputation)
+    skipped_eval_error = 0  # evaluation itself failed
+    skipped_exec_failed = 0 # function found but execution returned None
+
     for i, result in enumerate(result_manager.results_list):
         if not result or 'method_selector' not in result:
+            skipped_nonmissing += 1
             continue
-            
+
+        if not result.get('method_selector') or not result.get('behavior_estimator'):
+            skipped_failed += 1
+            logging.debug(f"Skipping failed result {i}: seq={result.get('sequence_id')}, seg={result.get('segment_id')}")
+            continue
+
         try:
             # Get function from SDKG
             function_id = result['method_selector']['selected_function_id']
             function = get_vf_function(sdkg, function_id)
             if not function:
+                skipped_exec_failed += 1
                 continue
                 
             # Get corresponding test data
@@ -121,6 +142,8 @@ def evaluate_imputed_result(args, result_manager, test_df, mark_missing_test, sd
             seg_data = seq_data[seq_data['segment_id'] == result['segment_id']]
             
             if seg_data.empty:
+                skipped_exec_failed += 1
+                logging.warning(f"No test data for result {i}: seq={result.get('sequence_id')}, seg={result.get('segment_id')}")
                 continue
             
             current_segment_id = result['segment_id']
@@ -141,6 +164,7 @@ def evaluate_imputed_result(args, result_manager, test_df, mark_missing_test, sd
             # Execute imputation with context segments
             imputed_traj = execute_imputation(function, seg_data, prev_segment_data, next_segment_data)
             if imputed_traj is None:
+                skipped_exec_failed += 1
                 continue
                 
             # Calculate errors (assuming entire segment is masked)
@@ -185,20 +209,45 @@ def evaluate_imputed_result(args, result_manager, test_df, mark_missing_test, sd
             processed_segments += 1
             
         except Exception as e:
+            skipped_eval_error += 1
             logging.warning(f"Failed to evaluate result {i}: {e}")
             continue
     
-    # Calculate final metrics
+    # Calculate final metrics (failure rate only counts segments that attempted imputation)
+    imputation_attempted = total_results - skipped_nonmissing
+    failure_count = skipped_failed + skipped_eval_error + skipped_exec_failed
+    failure_rate = failure_count / imputation_attempted if imputation_attempted > 0 else 0.0
+
     if not lat_errors:
         logging.error("No valid results to evaluate")
-        metrics = {"error": "No valid results"}
+        metrics = {
+            'error': 'No valid results',
+            'total_results': total_results,
+            'imputation_attempted': imputation_attempted,
+            'processed_segments': 0,
+            'processed_points': 0,
+            'skipped_nonmissing': skipped_nonmissing,
+            'skipped_failed_imputation': skipped_failed,
+            'skipped_exec_failed': skipped_exec_failed,
+            'skipped_eval_error': skipped_eval_error,
+            'failure_count': failure_count,
+            'failure_rate': round(failure_rate, 4),
+        }
         comparison_file = None
     else:
         lat_errors, lon_errors, spherical_dists = map(np.array, [lat_errors, lon_errors, spherical_dists])
-        
+
         metrics = {
+            'total_results': total_results,
+            'imputation_attempted': imputation_attempted,
             'processed_segments': processed_segments,
             'processed_points': len(lat_errors),
+            'skipped_nonmissing': skipped_nonmissing,
+            'skipped_failed_imputation': skipped_failed,
+            'skipped_exec_failed': skipped_exec_failed,
+            'skipped_eval_error': skipped_eval_error,
+            'failure_count': failure_count,
+            'failure_rate': round(failure_rate, 4),
             'latitude_mae': float(np.mean(lat_errors)),
             'longitude_mae': float(np.mean(lon_errors)),
             'latitude_rmse': float(np.sqrt(np.mean(lat_errors**2))),
@@ -215,15 +264,26 @@ def evaluate_imputed_result(args, result_manager, test_df, mark_missing_test, sd
     logging.info("\n" + "="*50)
     logging.info("IMPUTATION EVALUATION RESULTS")
     logging.info("="*50)
+    logging.info(f"Total results: {metrics['total_results']}")
+    logging.info(f"Non-missing (skipped): {metrics['skipped_nonmissing']}")
+    logging.info(f"Imputation attempted: {metrics['imputation_attempted']}")
     logging.info(f"Processed segments: {metrics['processed_segments']}")
     logging.info(f"Total points evaluated: {metrics['processed_points']}")
-    logging.info(f"Latitude MAE: {metrics['latitude_mae']:.6f}")
-    logging.info(f"Longitude MAE: {metrics['longitude_mae']:.6f}")
-    logging.info(f"Latitude RMSE: {metrics['latitude_rmse']:.6f}")
-    logging.info(f"Longitude RMSE: {metrics['longitude_rmse']:.6f}")
-    logging.info(f"Mean spherical distance: {metrics['mean_spherical_distance_km']:.4f} km")
-    logging.info(f"Max spherical distance: {metrics['max_spherical_distance_km']:.4f} km")
-    logging.info(f"Min spherical distance: {metrics['min_spherical_distance_km']:.4f} km")
+    logging.info(f"Skipped (failed imputation): {metrics['skipped_failed_imputation']}")
+    logging.info(f"Skipped (exec failed): {metrics['skipped_exec_failed']}")
+    logging.info(f"Skipped (eval error): {metrics['skipped_eval_error']}")
+    logging.info(f"Failure rate: {metrics['failure_rate']:.2%} ({metrics['failure_count']}/{metrics['imputation_attempted']})")
+    logging.info("-"*50)
+    if 'error' not in metrics:
+        logging.info(f"Latitude MAE: {metrics['latitude_mae']:.6f}")
+        logging.info(f"Longitude MAE: {metrics['longitude_mae']:.6f}")
+        logging.info(f"Latitude RMSE: {metrics['latitude_rmse']:.6f}")
+        logging.info(f"Longitude RMSE: {metrics['longitude_rmse']:.6f}")
+        logging.info(f"Mean spherical distance: {metrics['mean_spherical_distance_km']:.4f} km")
+        logging.info(f"Max spherical distance: {metrics['max_spherical_distance_km']:.4f} km")
+        logging.info(f"Min spherical distance: {metrics['min_spherical_distance_km']:.4f} km")
+    else:
+        logging.error(f"No valid metrics to display. {metrics['failure_count']}/{metrics['imputation_attempted']} segments failed.")
     
     if comparison_file:
         logging.info(f"Detailed comparison saved to: {comparison_file}")

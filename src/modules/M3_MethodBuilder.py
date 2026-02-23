@@ -6,9 +6,55 @@ sys.path.append(root_path)
 
 import re,pandas
 import logging
+import threading
 import numpy as np
 from src.utils.CallApi import call_qwen_api
 from src.modules.Prompt import Function_Prompt
+
+# Method Builder statistics (thread-safe)
+_mb_lock = threading.Lock()
+_mb_stats = {
+    'total_calls': 0,          # total generate_vf calls
+    'reuse_sdkg': 0,           # reused existing VF from SDKG directly
+    'first_attempt_success': 0, # LLM first attempt passed validation
+    'retry_success': 0,        # succeeded after retry
+    'final_failure': 0,        # failed after all retries
+    'total_llm_attempts': 0,   # total LLM calls made
+}
+
+def get_mb_stats():
+    with _mb_lock:
+        return _mb_stats.copy()
+
+def log_mb_stats():
+    s = get_mb_stats()
+    total = s['total_calls']
+    if total == 0:
+        logging.info("[MethodBuilder Stats] No calls recorded")
+        return s
+    llm_needed = total - s['reuse_sdkg']
+    first_success_rate_excl = s['first_attempt_success'] / llm_needed if llm_needed > 0 else 0
+    first_success_rate_incl = (s['reuse_sdkg'] + s['first_attempt_success']) / total
+    final_success = s['reuse_sdkg'] + s['first_attempt_success'] + s['retry_success']
+    final_success_rate = final_success / total if total > 0 else 0
+    avg_retries_excl = s['total_llm_attempts'] / llm_needed if llm_needed > 0 else 0
+    avg_retries_incl = s['total_llm_attempts'] / total
+    logging.info("=" * 50)
+    logging.info("METHOD BUILDER STATISTICS")
+    logging.info("=" * 50)
+    logging.info(f"Total calls: {total}")
+    logging.info(f"Reused from SDKG: {s['reuse_sdkg']} ({s['reuse_sdkg']/total:.1%})")
+    logging.info(f"LLM generation needed: {llm_needed}")
+    logging.info(f"  First-attempt success: {s['first_attempt_success']} ({first_success_rate_excl:.1%})")
+    logging.info(f"  Retry success: {s['retry_success']}")
+    logging.info(f"  Final failure: {s['final_failure']}")
+    logging.info(f"Total LLM attempts: {s['total_llm_attempts']}")
+    logging.info(f"Avg retries per generation (excl reuse): {avg_retries_excl:.2f}")
+    logging.info(f"First success rate (incl reuse): {first_success_rate_incl:.1%}")
+    logging.info(f"Avg retries (incl reuse): {avg_retries_incl:.2f}")
+    logging.info(f"Final success rate: {final_success}/{total} ({final_success_rate:.1%})")
+    logging.info("=" * 50)
+    return s
 
 def extract_function_and_description(text):
     """Extract function code and description from LLM output"""
@@ -64,18 +110,19 @@ def evaluate_function_on_batch(fn, minimal_seg_np):
 def generate_vf(args, vb, SDKG, minimal_seg):
     """Generate and validate spatial function for a vb """
     is_new_vf = True
-    
+
     def build_prompt(feedback_txt=""):
         return Function_Prompt.format(
             combined_data='\n'.join(minimal_seg['dynamic_info']).strip(),
             pattern=vb["llm_output"],
             feedback_txt=feedback_txt
         )
-    
+
     args.llm_purpose = "function"
-    
+
     attempt_ok = False
     last_err_msg = spatial_function_code = function_description = ""
+    llm_attempts = 0
 
     selected_vf = SDKG.select_Cf_vb(vb)
 
@@ -86,15 +133,18 @@ def generate_vf(args, vb, SDKG, minimal_seg):
 
         function = compile_function_from_code(spatial_function_code)
         e_f,mae_lat, mae_lon = evaluate_function_on_batch(function, minimal_seg[['latitude', 'longitude', 'timestamp']].to_numpy())
-        logging.info(f" Selected VF validation → {e_f}")           
+        logging.info(f" Selected VF validation → {e_f}")
         if e_f <= args.e_f:
             attempt_ok = True
-            is_new_vf = False 
+            is_new_vf = False
             logging.info("Selected VF passed validation")
+            with _mb_lock:
+                _mb_stats['total_calls'] += 1
+                _mb_stats['reuse_sdkg'] += 1
         else:
             logging.warning(f"Selected VF failed validation: e(f)={e_f:.6f}")
 
-    
+
     if not attempt_ok:
         logging.info("No suitable VF found in SDKG, generating new function...")
         for attempt in range(1, args.retry_times + 1):
@@ -107,6 +157,7 @@ def generate_vf(args, vb, SDKG, minimal_seg):
                     "and reduces e(f)=0.5*(MAE_lat+MAE_lon) below 3e-3 degrees.\n"
                 )
 
+            llm_attempts += 1
             try:
                 response_text = call_qwen_api(args, build_prompt(feedback_txt=feedback),args.coding_llm,'function')
                 spatial_function_code, function_description = extract_function_and_description(response_text)
@@ -120,7 +171,7 @@ def generate_vf(args, vb, SDKG, minimal_seg):
                 function = compile_function_from_code(spatial_function_code)
                 e_f, mae_lat, mae_lon = evaluate_function_on_batch(function, minimal_seg[['latitude', 'longitude', 'timestamp']].to_numpy())
                 logging.info(f"Attempt {attempt} validation → {e_f}")
-                
+
                 if e_f <= args.e_f:
                     attempt_ok = True
                     break
@@ -128,10 +179,21 @@ def generate_vf(args, vb, SDKG, minimal_seg):
                     last_err_msg = (
                         f"Error summary: MAE_lat={mae_lat:.6f} deg, MAE_lon={mae_lon:.6f} deg, "
                         f"e(f)={e_f:.6f} deg exceeds threshold {args.e_f:.6f} deg."
-                    )                    
+                    )
             except Exception as e:
                 last_err_msg = f"Runtime/validation error: {e}"
                 logging.warning(f"Attempt {attempt} error: {last_err_msg}")
+
+        # Record stats for LLM generation path
+        with _mb_lock:
+            _mb_stats['total_calls'] += 1
+            _mb_stats['total_llm_attempts'] += llm_attempts
+            if attempt_ok and llm_attempts == 1:
+                _mb_stats['first_attempt_success'] += 1
+            elif attempt_ok:
+                _mb_stats['retry_success'] += 1
+            else:
+                _mb_stats['final_failure'] += 1
 
     vf = {
         "spatial_function": spatial_function_code,

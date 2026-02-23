@@ -45,11 +45,16 @@ def generate_vb(args, minimal_seg, SDKG):
     duration = f"{lower}~{upper}"
     logging.info(f"Duration interval: {duration}")
     
-    # Generate prompt with available options
+    # Generate prompt with available options (cap each dict to stabilize token usage)
+    MAX_DICT_ENTRIES = 20
     field_dicts = SDKG.get_vb_attributes_dicts()
+    capped_dicts = {}
+    for key, d in field_dicts.items():
+        entries = list(d.keys())
+        capped_dicts[key] = entries[:MAX_DICT_ENTRIES] if len(entries) > MAX_DICT_ENTRIES else entries
     input_text = Pattern_Prompt.format(
         trajectory_data='\n'.join(minimal_seg['dynamic_info']).strip(),
-        **field_dicts
+        **capped_dicts
     )
     # Call LLM API to generate patterns
     raw_output = call_qwen_api(args, input_text,args.mining_llm,'pattern')

@@ -6,7 +6,7 @@ root_path = get_root_path()
 
 from src.modules.M1_StaticSpatialEncoder import generate_vs
 from src.modules.M2_BehaviorAbstraction import generate_vb
-from src.modules.M3_MethodBuilder import generate_vf
+from src.modules.M3_MethodBuilder import generate_vf, log_mb_stats
 from src.modules.M4_BehaviorEstimator import behavior_estimator
 from src.modules.M5_MethodSelector import method_selector
 from src.modules.M6_ExplanationComposer import explanation_composer
@@ -69,6 +69,8 @@ def SDKG_Construction_Multithreading(
         end_idx=end_idx,
         minimal_seg_nums=minimal_seg_nums,
     )
+
+    log_mb_stats()
 
     return SDKG, ku_manager
 

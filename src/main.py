@@ -48,7 +48,9 @@ def pipline_VISTA_Multithreading(args):
     else : 
         logging.info(f"Result Manager loaded up to checkpoint {args.end_point_sdkg}, skipping imputate_missing_segments.")
 
-    # evaluate the imputed result
+    # evaluate the imputed result (merge all batch results, recover historical functions)
+    result_manager.load_all_results_list()
+    sdkg.recover_historical_vf_nodes()
     evaluate_imputed_result(args, result_manager, test_df, mark_missing_test,sdkg)
 
 if __name__ == "__main__":

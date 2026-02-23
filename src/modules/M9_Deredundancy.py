@@ -1,22 +1,88 @@
 from src.utils.CallApi import call_qwen_api
 from src.modules.Prompt import Redundancy_Analysis_Prompt
+import re
 import logging
 
-def deredundancy(args, SDKG, knowledge_unit_list, new_flags_list,vf_flags_list):
-    
+def local_dedup_vb(SDKG, knowledge_unit_list, new_flags_list):
+    """Local exact-match dedup for VB attributes: merge identical strings before LLM call."""
+    deduped_count = 0
+    attribute_dicts = SDKG.get_vb_attributes_dicts()
+    dict_mapping = {
+        "speed_profile": attribute_dicts["speed_dict"],
+        "course_change": attribute_dicts["course_dict"],
+        "heading_fluctuation": attribute_dicts["heading_dict"],
+        "intent": attribute_dicts["intent_dict"]
+    }
+
+    for i, (knowledge_unit, new_flags) in enumerate(zip(knowledge_unit_list, new_flags_list)):
+        if not knowledge_unit or 'v_b' not in knowledge_unit or not new_flags:
+            continue
+        for attribute, is_new in new_flags.items():
+            if not is_new or attribute not in dict_mapping or attribute not in knowledge_unit['v_b']:
+                continue
+            current_value = re.split(r'[(:]', str(knowledge_unit['v_b'][attribute]), 1)[0].strip().lower()
+            # Check if an existing dict entry matches exactly (case-insensitive)
+            for existing_key in dict_mapping[attribute]:
+                if existing_key.lower() == current_value and existing_key != knowledge_unit['v_b'][attribute]:
+                    logging.info(f"[Local dedup VB] '{knowledge_unit['v_b'][attribute]}' -> existing '{existing_key}'")
+                    knowledge_unit['v_b'][attribute] = existing_key
+                    new_flags[attribute] = False
+                    deduped_count += 1
+                    break
+
+    if deduped_count > 0:
+        logging.info(f"[Local dedup] merged {deduped_count} VB attributes by exact match")
+    return deduped_count
+
+def local_dedup_vf(knowledge_unit_list, vf_flags_list):
+    """Local exact-match dedup for VF functions: unify identical code within batch."""
+    deduped_count = 0
+    code_to_first = {}  # code_hash -> index of first occurrence
+
+    for i, (knowledge_unit, is_new_vf) in enumerate(zip(knowledge_unit_list, vf_flags_list)):
+        if not is_new_vf or not knowledge_unit or 'v_f' not in knowledge_unit or not knowledge_unit['v_f']:
+            continue
+        code = knowledge_unit['v_f'].get('spatial_function', '').strip()
+        if not code:
+            continue
+        code_hash = hash(code)
+        if code_hash in code_to_first:
+            # Identical code already seen in this batch — point to same vf
+            first_idx = code_to_first[code_hash]
+            first_ku = knowledge_unit_list[first_idx]
+            if first_ku and 'v_f' in first_ku and first_ku['v_f']:
+                knowledge_unit['v_f'] = first_ku['v_f'].copy()
+                vf_flags_list[i] = False
+                deduped_count += 1
+                logging.info(f"[Local dedup VF] batch item {i} identical to {first_idx}, unified")
+        else:
+            code_to_first[code_hash] = i
+
+    if deduped_count > 0:
+        logging.info(f"[Local dedup] unified {deduped_count} VF functions by exact code match")
+    return deduped_count
+
+def deredundancy(args, SDKG, knowledge_unit_list, new_flags_list, vf_flags_list):
+
     if not knowledge_unit_list:
         return knowledge_unit_list
+
+    #return knowledge_unit_list
+
+    # Local exact-match dedup before LLM call
+    local_dedup_vb(SDKG, knowledge_unit_list, new_flags_list)
+    local_dedup_vf(knowledge_unit_list, vf_flags_list)
 
     vb_data_text, all_vb_data, dict_mapping = prepare_vb_data(SDKG, knowledge_unit_list, new_flags_list)
     logging.info(f"vb_data_text:{vb_data_text}")
     logging.info(f"all_vb_data:{all_vb_data}")
     logging.info(f"dict_mapping:{dict_mapping}")
-    
+
     vf_data_text = prepare_vf_data(SDKG, knowledge_unit_list, vf_flags_list)
     logging.info(f"vf_data_text:{vf_data_text}")
-    
+
     if vb_data_text or vf_data_text:
-        combined_redundancy_analysis(args, SDKG, vb_data_text, vf_data_text, all_vb_data, dict_mapping,knowledge_unit_list)
+        combined_redundancy_analysis(args, SDKG, vb_data_text, vf_data_text, all_vb_data, dict_mapping, knowledge_unit_list)
 
     return knowledge_unit_list
 
@@ -30,13 +96,22 @@ def prepare_vb_data(SDKG, knowledge_unit_list, new_flags_list):
         "intent": attribute_dicts["intent_dict"]
     }
 
+    # Early return: skip if no new VB attributes in this batch
+    has_any_new = any(
+        any(is_new for is_new in new_flags.values())
+        for new_flags in new_flags_list if new_flags
+    )
+    if not has_any_new:
+        logging.info("VB early return: no new attributes in this batch, skipping VB redundancy analysis")
+        return "", [], dict_mapping
+
     all_vb_data = []
     vb_data_text = ""
-    
+
     for i, (knowledge_unit, new_flags) in enumerate(zip(knowledge_unit_list, new_flags_list)):
         if not knowledge_unit or 'v_b' not in knowledge_unit:
             continue
-            
+
         vb_data = {
             'index': i,
             'knowledge_unit': knowledge_unit,
@@ -47,65 +122,73 @@ def prepare_vb_data(SDKG, knowledge_unit_list, new_flags_list):
         for attribute, is_new in new_flags.items():
             if is_new and attribute in dict_mapping and attribute in knowledge_unit['v_b']:
                 current_value = knowledge_unit['v_b'][attribute]
-                dict_values = list(dict_mapping[attribute].keys())
+                all_values = list(dict_mapping[attribute].keys())
+                dict_values = all_values[:20] if len(all_values) > 20 else all_values
                 vb_data['attributes_to_check'][attribute] = {
                     'current_value': current_value,
                     'dict_values': dict_values
                 }
-        
+
         if vb_data['attributes_to_check']:
             all_vb_data.append(vb_data)
 
             sequence_id = knowledge_unit.get('sequence_id', 'unknown')
             segment_id = knowledge_unit.get('segment_id', 'unknown')
             vb_data_text += f"\nVB {i} (Sequence {sequence_id}, Segment {segment_id}):\n"
-            
+
             for attribute, data in vb_data['attributes_to_check'].items():
                 current_value = data['current_value']
                 dict_values = data['dict_values']
-                
+
                 vb_data_text += f"  Attribute: {attribute}\n"
                 vb_data_text += f"  Current value: {current_value}\n"
                 vb_data_text += f"  Dictionary values ({len(dict_values)}):\n"
                 for value in dict_values:
                     vb_data_text += f"    - {value}\n"
                 vb_data_text += "\n"
-    
+
     return vb_data_text, all_vb_data, dict_mapping
 
 def prepare_vf_data(SDKG, knowledge_unit_list, vf_flags_list):
-    """Prepare VF data for redundancy analysis, only process when vf_flag is True"""
-    all_vfs = {}
+    """Prepare VF data for redundancy analysis: new VFs (full code) vs existing VFs (description only)"""
+    new_vfs = {}
 
     for i, (knowledge_unit, is_new_vf) in enumerate(zip(knowledge_unit_list, vf_flags_list)):
         if is_new_vf and knowledge_unit and 'v_f' in knowledge_unit and knowledge_unit['v_f']:
             code = knowledge_unit['v_f'].get('spatial_function', '')
             if code:
                 vf_id = knowledge_unit['v_f'].get('vf_id', f"temp_vf_{i}")
-                all_vfs[vf_id] = {
+                new_vfs[vf_id] = {
                     'code': code,
+                    'description': knowledge_unit['v_f'].get('describe_of_function', ''),
                     'knowledge_unit': knowledge_unit,
                     'source': 'current_batch'
                 }
 
-    existing_vf_nodes = SDKG.load_vf_node()
-    for vf_id, vf_node in existing_vf_nodes.items():
-        if 'code' in vf_node:
-            all_vfs[vf_id] = {
-                'code': vf_node['code'],
-                'knowledge_unit': None,
-                'source': 'SDKG'
-            }
-    
-    if len(all_vfs) <= 1:
+    if not new_vfs:
         return ""
-        
-    vf_data_text = "SPATIAL FUNCTIONS - Code Samples with IDs:\n"
-    for vf_id, data in all_vfs.items():
-        code = data['code']
-        source = data['source']
-        vf_data_text += f"\nFunction ID: {vf_id} (from {source}):\n```python\n{code}\n```\n"
-    
+
+    existing_vf_nodes = SDKG.load_vf_node()
+
+    if not existing_vf_nodes and len(new_vfs) <= 1:
+        return ""
+
+    vf_data_text = "NEW SPATIAL FUNCTIONS (full code, to be checked for redundancy):\n"
+    for vf_id, data in new_vfs.items():
+        vf_data_text += f"\nFunction ID: {vf_id}:\n```python\n{data['code']}\n```\n"
+        if data['description']:
+            vf_data_text += f"Description: {data['description']}\n"
+
+    if existing_vf_nodes:
+        MAX_EXISTING_VF = 30
+        existing_items = list(existing_vf_nodes.items())
+        if len(existing_items) > MAX_EXISTING_VF:
+            existing_items = existing_items[-MAX_EXISTING_VF:]
+        vf_data_text += f"\nEXISTING SPATIAL FUNCTIONS in SD-KG ({len(existing_items)}/{len(existing_vf_nodes)} shown, compare new functions against these by description):\n"
+        for vf_id, vf_node in existing_items:
+            desc = vf_node.get('description', '')
+            vf_data_text += f"\nFunction ID: {vf_id}: {desc}\n" if desc else f"\nFunction ID: {vf_id}: (no description)\n"
+
     return vf_data_text
 
 def combined_redundancy_analysis(args, SDKG, vb_data_text, vf_data_text, all_vb_data, dict_mapping,knowledge_unit_list):

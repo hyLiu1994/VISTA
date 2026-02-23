@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import math
 import logging
 from src.utils.HyperParameters import root_path
 class SDKG:
@@ -170,8 +171,8 @@ class SDKG:
                     weight_map = self.SDK_graph_vs[attr_name][attr_value]  
                     for vb_id, weight in weight_map.items():
                         if vb_id not in candidate_vbs:
-                            candidate_vbs[vb_id] = 1.0
-                        candidate_vbs[vb_id] *= (float(weight) + 1.0)
+                            candidate_vbs[vb_id] = 0.0
+                        candidate_vbs[vb_id] += math.log(float(weight) + 1.0)
         
         if not candidate_vbs:
             return ([], [])
@@ -216,8 +217,8 @@ class SDKG:
                 
                 for vf_id, weight in vf_weight_map.items():
                     if vf_id not in candidate_vfs:
-                        candidate_vfs[vf_id] = 1.0
-                    candidate_vfs[vf_id] *= (float(weight) + 1.0)
+                        candidate_vfs[vf_id] = 0.0
+                    candidate_vfs[vf_id] += math.log(float(weight) + 1.0)
 
         if not candidate_vfs:
             return ([], [])
@@ -524,4 +525,26 @@ class SDKG:
                 self.SDK_graph_vf_node = json.load(f)["SDK_graph_vf_node"]
         else:
             logging.info(f"SDK_graph_vf_node_{str(start_point)}.json not found")
- 
+
+    def recover_historical_vf_nodes(self):
+        """Scan all SDK_graph_vf_node checkpoint files and recover functions
+        that were removed by deredundancy, so evaluation can find them."""
+        recovered = 0
+        for fname in os.listdir(self.base_dir):
+            if not (fname.startswith("SDK_graph_vf_node_") and fname.endswith(".json")):
+                continue
+            filepath = os.path.join(self.base_dir, fname)
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    data = json.load(f).get("SDK_graph_vf_node", {})
+                for func_id, func_data in data.items():
+                    if func_id not in self.SDK_graph_vf_node:
+                        self.SDK_graph_vf_node[func_id] = func_data
+                        recovered += 1
+            except Exception as e:
+                logging.warning(f"Failed to load {fname}: {e}")
+        logging.info(
+            f"[recover_historical_vf_nodes] recovered {recovered} functions, "
+            f"total vf_nodes: {len(self.SDK_graph_vf_node)}"
+        )
+

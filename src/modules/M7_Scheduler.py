@@ -117,6 +117,51 @@ class ImputationResultsManager:
             logging.info(f"successful load file_path:{file_path}")
         return
 
+    def load_all_results_list(self):
+        """Scan base_dir for all batch result files.
+        Files are cumulative (each batch saves all previous results + current),
+        so we just pick the file with the largest end_point (and largest checkpoint
+        within that end_point) which contains the complete data."""
+        if not os.path.isdir(self.base_dir):
+            logging.warning(f"[load_all_results_list] directory not found: {self.base_dir}")
+            return
+
+        prefix = self.filename_prefix + "_"
+        suffix = ".json"
+
+        # Collect (end_point, checkpoint, filepath) tuples
+        entries = []
+        for fname in os.listdir(self.base_dir):
+            if not (fname.startswith(prefix) and fname.endswith(suffix)):
+                continue
+            # e.g. fname = "imputation_results_..._200_150.json"
+            body = fname[len(prefix):-len(suffix)]  # "200_150"
+            parts = body.split("_")
+            if len(parts) != 2:
+                continue
+            try:
+                end_point = int(parts[0])
+                checkpoint = int(parts[1])
+            except ValueError:
+                continue
+            entries.append((end_point, checkpoint, os.path.join(self.base_dir, fname)))
+
+        if not entries:
+            logging.info("[load_all_results_list] no batch result files found")
+            return
+
+        # Pick the file with the largest end_point, then largest checkpoint
+        best_ep, best_ck, best_fp = max(entries, key=lambda x: (x[0], x[1]))
+
+        with open(best_fp, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        self.results_list = data
+        logging.info(
+            f"[load_all_results_list] loaded {os.path.basename(best_fp)} "
+            f"(end_point={best_ep}, checkpoint={best_ck}, {len(data)} items)"
+        )
+
     def save_results_list(self, end_point: int,args):
         """Save imputation results Returns: Saved file path"""
         output_path = os.path.join(self.base_dir, f"{self.filename_prefix}_{args.end_point}_{end_point}.json")
@@ -198,7 +243,7 @@ def stack_schedule_sdk_construction(
     end_idx: int,
     minimal_seg_nums: int,
 ) -> Tuple[Any, Any]:
-    logging.info("Stack-Based Scheduler start (pseudo-structured pipeline)")
+    logging.info("Stack-Based Scheduler start (pipelined)")
 
     sdk_write_lock = threading.Lock()
     last_checkpoint_traj = start_idx
@@ -211,57 +256,46 @@ def stack_schedule_sdk_construction(
 
     s_c_stack = tasks.copy()
     s_d_stack: List[Tuple[Dict[str, Any], Any, Any]] = []
-    future_to_task: Dict[concurrent.futures.Future, Dict[str, Any]] = {}
+    sc_inflight: Dict[concurrent.futures.Future, Dict[str, Any]] = {}
     sd_inflight: List[concurrent.futures.Future] = []
 
     try:
-        while s_c_stack or s_d_stack or sd_inflight:
-            # Popbatch
-            if s_c_stack:
-                batch: List[Dict[str, Any]] = []
-                for _ in range(min(extraction_batch_size, len(s_c_stack))):
-                    batch.append(s_c_stack.pop())
+        while s_c_stack or sc_inflight or s_d_stack or sd_inflight:
+            # Submit new extraction tasks if capacity available
+            while s_c_stack and len(sc_inflight) < extraction_batch_size:
+                t = s_c_stack.pop()
+                f = executor.submit(process_single_segment_fn, SDKG, args, t)
+                sc_inflight[f] = t
+                logging.info(f"[S_c submit] seq {t['seq_idx']} seg {t['segment_id']}")
 
-                #Parallel
-                batch_futures = []
-                for t in batch:
-                    f = executor.submit(process_single_segment_fn, SDKG, args, t)
-                    future_to_task[f] = t
-                    batch_futures.append(f)
-                    logging.info(f"[S_c submit] seq {t['seq_idx']} seg {t['segment_id']}")
-
-                concurrent.futures.wait(batch_futures, return_when=concurrent.futures.ALL_COMPLETED)
-
-                for f in batch_futures:
-                    #Anomaly detection
-                    t = future_to_task.pop(f)
+            # Collect completed extraction results (non-blocking)
+            if sc_inflight:
+                done, _ = concurrent.futures.wait(sc_inflight.keys(), timeout=0.05, return_when=concurrent.futures.FIRST_COMPLETED)
+                for f in done:
+                    t = sc_inflight.pop(f)
                     result, should_retry = handle_task_exception_with_retry(
                         f, t, ku_manager.knowledge_unit_list, "SDKG", args.max_retries, SDKG
                     )
-                    #success
                     if result is not None and result.get('result'):
-                        #push to Sd
                         s_d_stack.append((result['result'], result.get('new_flags'), result.get('is_new_vf')))
                         logging.info(f"[S_c→S_d push] seq {t['seq_idx']} seg {t['segment_id']}")
-                    #retry times < max retry times
                     elif should_retry:
                         t['retry_count'] = t.get('retry_count', 0) + 1
                         s_c_stack.append(t)
                         logging.warning(f"[Retry queued] seq {t['seq_idx']} seg {t['segment_id']} (#{t['retry_count']})")
-                    #fail
                     else:
                         logging.error(f"[Extract failed] seq {t['seq_idx']} seg {t['segment_id']} after {args.max_retries}")
 
-            if s_d_stack and (len(sd_inflight) < deredundancy_batch_size):
-                #Popbatch
+            # Submit deredundancy if S_d has items and capacity available
+            if s_d_stack and len(sd_inflight) < deredundancy_batch_size:
                 batch_kus, batch_flags, batch_vf = [], [], []
-                for _ in range(min(extraction_batch_size, len(s_d_stack))):
+                for _ in range(min(deredundancy_batch_size, len(s_d_stack))):
                     ku, flg, vf = s_d_stack.pop()
                     batch_kus.append(ku); batch_flags.append(flg); batch_vf.append(vf)
-                fb = deredun_executor.submit(deredundancy, args, SDKG,list(batch_kus), list(batch_flags), list(batch_vf))
+                fb = deredun_executor.submit(deredundancy, args, SDKG, list(batch_kus), list(batch_flags), list(batch_vf))
                 sd_inflight.append(fb)
-                
-            #Update the SDKG
+
+            # Collect completed deredundancy results (non-blocking)
             if sd_inflight:
                 done, _ = concurrent.futures.wait(sd_inflight, timeout=0, return_when=concurrent.futures.FIRST_COMPLETED)
                 for fb in list(done):
@@ -292,7 +326,9 @@ def stack_schedule_sdk_construction(
                 logging.info(f"[Checkpoint] traj={current_traj_idx}")
                 last_checkpoint_traj = current_traj_idx
 
-            time.sleep(0.001)
+            # Avoid busy-wait when nothing is in-flight yet
+            if not sc_inflight and not sd_inflight:
+                time.sleep(0.001)
 
         # Final checkpoint
         final_traj_idx = len(ku_manager.knowledge_unit_list) // minimal_seg_nums
@@ -321,54 +357,48 @@ def stack_schedule_imputation(
     end_idx: int,
     minimal_seg_nums: int,
 ) -> Any:
-    logging.info("Stack-Based Scheduler (Trajectory Imputation) start")
+    logging.info("Stack-Based Scheduler (Trajectory Imputation) start (pipelined)")
 
     s_i_stack = tasks.copy()
     last_checkpoint_traj = start_idx
     batch_size = args.max_concurrent
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.max_concurrent)
+    si_inflight: Dict[concurrent.futures.Future, Dict[str, Any]] = {}
 
     try:
-        while s_i_stack:
-            #POPBATCH
-            batch = []
-            for _ in range(min(batch_size, len(s_i_stack))):
-                batch.append(s_i_stack.pop())
-
-            batch_futures = []
-            future_to_task: Dict[concurrent.futures.Future, Dict[str, Any]] = {}
-            for task in batch:
- 
+        while s_i_stack or si_inflight:
+            # Submit new imputation tasks if capacity available
+            while s_i_stack and len(si_inflight) < batch_size:
+                task = s_i_stack.pop()
                 fut = executor.submit(process_single_segment_fn, task, args, SDKG, context_info_manager)
-                future_to_task[fut] = task
-                batch_futures.append(fut)
+                si_inflight[fut] = task
                 if task.get('type') != 'skip':
                     logging.info(f"[S_i submit] seq {task['seq_idx']} seg {task['segment_id']}")
 
-            concurrent.futures.wait(batch_futures, return_when=concurrent.futures.ALL_COMPLETED)
-
-            for fut in batch_futures:
-                #Anomaly detect
-                task = future_to_task[fut]
-                result, should_retry = handle_task_exception_with_retry(
-                    fut, task, result_manager.results_list, "imputation", args.max_retries, SDKG
-                )
-                #success
-                if result is not None:
-                    if task.get('type') != 'skip':
-                        logging.info(f"[Imputed] seq {task['seq_idx']} seg {task['segment_id']}")
+            # Collect completed results (non-blocking)
+            if si_inflight:
+                done, _ = concurrent.futures.wait(si_inflight.keys(), timeout=0.05, return_when=concurrent.futures.FIRST_COMPLETED)
+                for fut in done:
+                    task = si_inflight.pop(fut)
+                    result, should_retry = handle_task_exception_with_retry(
+                        fut, task, result_manager.results_list, "imputation", args.max_retries, SDKG
+                    )
+                    #success
+                    if result is not None:
+                        if task.get('type') != 'skip':
+                            logging.info(f"[Imputed] seq {task['seq_idx']} seg {task['segment_id']}")
+                        else:
+                            logging.info(f"[Skipped] seq {task['seq_idx']} seg {task['segment_id']}")
+                    #retry times < max retry times
+                    elif should_retry:
+                        task['retry_count'] = task.get('retry_count', 0) + 1
+                        s_i_stack.append(task)
+                        logging.warning(f"[Retry queued] seq {task['seq_idx']} seg {task['segment_id']} (#{task['retry_count']})")
+                    #fail
                     else:
-                        logging.info(f"[Skipped] seq {task['seq_idx']} seg {task['segment_id']}")
-                #retry times < max retry times
-                elif should_retry:
-                    task['retry_count'] = task.get('retry_count', 0) + 1
-                    s_i_stack.append(task)
-                    logging.warning(f"[Retry queued] seq {task['seq_idx']} seg {task['segment_id']} (#{task['retry_count']})")
-                #fail
-                else:
-                    logging.error(f"[Failed] seq {task['seq_idx']} seg {task['segment_id']} after {args.max_retries}")
-            
+                        logging.error(f"[Failed] seq {task['seq_idx']} seg {task['segment_id']} after {args.max_retries}")
+
             #check point
             current_traj_idx = len(result_manager.results_list) // minimal_seg_nums
             target_traj = min(last_checkpoint_traj + args.process_length, end_idx)
@@ -377,7 +407,9 @@ def stack_schedule_imputation(
                 logging.info(f"[Checkpoint] traj={current_traj_idx}")
                 last_checkpoint_traj = current_traj_idx
 
-            time.sleep(0.01)
+            # Avoid busy-wait when nothing is in-flight
+            if not si_inflight:
+                time.sleep(0.001)
 
         #Final Checkpoint
         final_traj_idx = len(result_manager.results_list) // minimal_seg_nums
